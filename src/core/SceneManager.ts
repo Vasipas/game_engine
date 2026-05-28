@@ -74,7 +74,7 @@ export class SceneManager {
       // INIT ONCE
       await next._initOnce();
 
-      // LOAD ONCE — async GPU sources unload (textures, models)
+      // LOAD ONCE — async GPU sources load (textures, models)
       await next._loadOnce();
 
       // 5. ENTER

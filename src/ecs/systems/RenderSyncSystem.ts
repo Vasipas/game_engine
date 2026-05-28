@@ -3,7 +3,7 @@ import { PositionComponent } from "../components/PositionComponent";
 import type { World } from "../World";
 
 export class RenderSyncSystem {
-  public priority = 2;
+  public priority = 3;
   constructor(private world: World) {}
 
   update(delta: number) {
