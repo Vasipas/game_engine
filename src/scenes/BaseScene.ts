@@ -6,7 +6,7 @@ const $loaded = Symbol("loaded");
 
 export abstract class BaseScene {
   public readonly scene: THREE.Scene;
-  public readonly camera: THREE.PerspectiveCamera;
+  public camera!: THREE.PerspectiveCamera;
 
   protected context!: SceneContext;
 
@@ -16,13 +16,6 @@ export abstract class BaseScene {
   constructor() {
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x7c3aed);
-
-    this.camera = new THREE.PerspectiveCamera(
-      75,
-      window.innerWidth / window.innerHeight,
-      0.1,
-      1000,
-    );
   }
 
   // Public lifecycle hooks (overridden in subclasses)

@@ -3,7 +3,6 @@ import type { World } from "../World";
 import { PositionComponent } from "../components/PositionComponent";
 import { VelocityComponent } from "../components/VelocityComponent";
 import { MeshComponent } from "../components/MeshComponent";
-import { CameraFollowComponent } from "../components/CameraFollowComponent";
 
 export class PlayerFactory {
   static create(world: World, scene: THREE.Scene) {
@@ -20,10 +19,6 @@ export class PlayerFactory {
 
     world.addComponent(entity, new PositionComponent(0, 1, 0));
     world.addComponent(entity, new VelocityComponent());
-    world.addComponent(
-      entity,
-      new CameraFollowComponent(new THREE.Vector3(0, 4, 8), 5),
-    );
     world.addComponent(entity, new MeshComponent(mesh));
 
     return entity;

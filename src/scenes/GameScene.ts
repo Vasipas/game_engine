@@ -8,21 +8,29 @@ import { PlayerFactory } from "../ecs/entities/PlayerFactory";
 import { FloorFactory } from "../ecs/entities/FloorFactory";
 import { CameraFollowSystem } from "../ecs/systems/CameraFolowSystem";
 import { DirectionalLightFactory } from "../ecs/entities/DirectionalLightFactory";
-import { AmbientLightFactory } from "../ecs/entities/AmbientLightFactory copy";
+import { AmbientLightFactory } from "../ecs/entities/AmbientLightFactory";
+import { PerspectiveCameraFactory } from "../ecs/entities/PerspectiveCameraFactory";
 
 export class GameScene extends BaseScene {
   private world = new World();
   private systems = new SystemManager();
 
   init() {
+    const player = PlayerFactory.create(this.world, this.scene);
+    this.camera = new THREE.PerspectiveCamera(
+      75,
+      window.innerWidth / window.innerHeight,
+      0.1,
+      1000,
+    );
+
+    PerspectiveCameraFactory.create(this.world, this.camera, player);
     AmbientLightFactory.create(this.scene);
     DirectionalLightFactory.create(this.scene);
-
     FloorFactory.create(this.scene);
-    PlayerFactory.create(this.world, this.scene);
 
     this.systems.add(new MovementSystem(this.world, this.context.input));
-    this.systems.add(new CameraFollowSystem(this.world, this.camera));
+    this.systems.add(new CameraFollowSystem(this.world));
     this.systems.add(new RenderSyncSystem(this.world));
   }
 

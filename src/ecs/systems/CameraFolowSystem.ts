@@ -11,32 +11,34 @@ export class CameraFollowSystem {
 
   private firstUpdate = true;
 
-  constructor(
-    private world: World,
-    private camera: THREE.Camera,
-  ) {}
+  constructor(private world: World) {}
 
   update(delta: number) {
-    const follows = this.world.query(CameraFollowComponent, PositionComponent);
+    const follows = this.world.query(CameraFollowComponent);
 
     for (const entity of follows) {
-      const position = this.world.getComponent(entity, PositionComponent);
       const follow = this.world.getComponent(entity, CameraFollowComponent);
+
+      if (follow.target === null) continue;
+
+      const position = this.world.getComponent(
+        follow.target,
+        PositionComponent,
+      );
 
       if (!position || !follow) continue;
 
       this._tmpPosition.copy(position).add(this.offset);
 
       if (this.firstUpdate) {
-        this.camera.position.copy(this._tmpPosition);
+        follow.camera.position.copy(this._tmpPosition);
         this.firstUpdate = false;
       } else {
         const alpha = 1 - Math.exp(-follow.smoothing * delta);
-
-        this.camera.position.lerp(this._tmpPosition, alpha);
+        follow.camera.position.lerp(this._tmpPosition, alpha);
       }
 
-      this.camera.lookAt(position.x, position.y, position.z);
+      follow.camera.lookAt(position.x, position.y, position.z);
     }
   }
 }
