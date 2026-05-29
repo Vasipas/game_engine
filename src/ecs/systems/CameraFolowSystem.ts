@@ -1,4 +1,5 @@
 import { CameraFollowComponent } from "../components/CameraFollowComponent";
+import { MouseLookComponent } from "../components/MouseLookComponent";
 import { PositionComponent } from "../components/PositionComponent";
 import type { World } from "../World";
 import * as THREE from "three";
@@ -7,7 +8,7 @@ export class CameraFollowSystem {
   public priority = 2;
 
   private _tmpPosition = new THREE.Vector3();
-  private offset = new THREE.Vector3(0, 5, 10);
+  private _direction = new THREE.Vector3();
 
   private firstUpdate = true;
 
@@ -18,6 +19,7 @@ export class CameraFollowSystem {
 
     for (const entity of follows) {
       const follow = this.world.getComponent(entity, CameraFollowComponent);
+      const look = this.world.getComponent(entity, MouseLookComponent);
 
       if (follow.target === null) continue;
 
@@ -26,9 +28,27 @@ export class CameraFollowSystem {
         PositionComponent,
       );
 
-      if (!position || !follow) continue;
+      if (!position) continue;
 
-      this._tmpPosition.copy(position).add(this.offset);
+      if (look) {
+        this._direction.set(
+          Math.cos(look.pitch) * Math.sin(look.yaw),
+          Math.sin(look.pitch),
+          Math.cos(look.pitch) * Math.cos(look.yaw),
+        );
+      } else {
+        this._direction.set(0, 0, 4);
+      }
+
+      const distance = THREE.MathUtils.clamp(
+        follow.distance,
+        follow.minDistance ?? 2,
+        follow.maxDistance ?? 10,
+      );
+
+      this._direction.multiplyScalar(distance);
+      this._tmpPosition.copy(position).sub(this._direction);
+      this._tmpPosition.y += follow.height ?? 0;
 
       if (this.firstUpdate) {
         follow.camera.position.copy(this._tmpPosition);

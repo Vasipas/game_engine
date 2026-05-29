@@ -15,7 +15,7 @@ export class World {
     this.components.get(type)?.set(entity, component);
   }
   getComponent<T>(entity: number, componenClass: new (...args: any[]) => T): T {
-    return this.components.get(componenClass)!.get(entity);
+    return this.components.get(componenClass)?.get(entity);
   }
 
   hasComponent(entity: number, componentClass: Function): boolean {

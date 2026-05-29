@@ -10,6 +10,7 @@ import { CameraFollowSystem } from "../ecs/systems/CameraFolowSystem";
 import { DirectionalLightFactory } from "../ecs/entities/DirectionalLightFactory";
 import { AmbientLightFactory } from "../ecs/entities/AmbientLightFactory";
 import { PerspectiveCameraFactory } from "../ecs/entities/PerspectiveCameraFactory";
+import { MouseMoveSystem } from "../ecs/systems/MouseMoveSystem";
 
 export class GameScene extends BaseScene {
   private world = new World();
@@ -20,22 +21,29 @@ export class GameScene extends BaseScene {
     this.camera = new THREE.PerspectiveCamera(
       75,
       window.innerWidth / window.innerHeight,
-      0.1,
+      2,
       1000,
     );
 
-    PerspectiveCameraFactory.create(this.world, this.camera, player);
+    PerspectiveCameraFactory.create(this.world, this.camera, player, {
+      position: new THREE.Vector3(0, 4, 20),
+      lookAtTarget: false,
+      smoothing: 20,
+      distance: 5,
+    });
     AmbientLightFactory.create(this.scene);
     DirectionalLightFactory.create(this.scene);
     FloorFactory.create(this.scene);
 
     this.systems.add(new MovementSystem(this.world, this.context.input));
     this.systems.add(new CameraFollowSystem(this.world));
+    this.systems.add(new MouseMoveSystem(this.world, this.context.input));
     this.systems.add(new RenderSyncSystem(this.world));
   }
 
   update(delta: number, elapsed: number) {
     this.systems.update(delta, elapsed);
+    this.context.input.clearDelta();
   }
 
   dispose() {

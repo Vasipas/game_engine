@@ -35,7 +35,7 @@ export class SceneManager {
   register(key: TSceneKeys, scene: BaseScene): this {
     if (this.scenes.has(key)) {
       console.warn(
-        `[SceneManager] Сцена "${key}" уже зарегистрирована, перезаписываем`,
+        `[SceneManager] Scene "${key}" already registered, rewriting`,
       );
     }
     scene.setContext(this.createContext());
@@ -46,7 +46,7 @@ export class SceneManager {
   async setActive(key: TSceneKeys): Promise<void> {
     if (this.isSwitching) {
       console.warn(
-        `[SceneManager] Переключение уже идёт, игнорируем запрос на "${key}"`,
+        `[SceneManager] Switching in process, ignored request on "${key}"`,
       );
       return;
     }
@@ -55,7 +55,7 @@ export class SceneManager {
 
     const next = this.scenes.get(key);
     if (!next) {
-      console.error(`[SceneManager] Сцена "${key}" не найдена`);
+      console.error(`[SceneManager] Scene "${key}" not found`);
       return;
     }
 
