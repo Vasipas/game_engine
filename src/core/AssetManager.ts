@@ -1,101 +1,126 @@
-/**
- * AssetManager — производительный менеджер ресурсов для Three.js
- *
- * Возможности:
- *   - Параллельная загрузка с ограничением конкурентности
- *   - LRU-кэш с TTL и ограничением памяти
- *   - Дедупликация одновременных запросов (inflight)
- *   - Приоритеты загрузки (critical / high / normal / low)
- *   - Прогресс загрузки через EventEmitter
- *   - Автоматическое освобождение GPU-ресурсов (dispose)
- *   - Поддержка: GLB/GLTF, текстуры, аудио, JSON, кубические карты
- *   - Retry с экспоненциальным backoff
- *   - Tree-shaking: подключайте только нужные загрузчики
- */
-
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
 import { KTX2Loader } from "three/examples/jsm/loaders/KTX2Loader.js";
 import { RGBELoader } from "three/examples/jsm/loaders/RGBELoader.js";
 
-// ─── Константы ───────────────────────────────────────────────────────────────
+// ─── Types & Constants ───────────────────────────────────────────────────────
 
-const Priority = Object.freeze({ CRITICAL: 0, HIGH: 1, NORMAL: 2, LOW: 3 });
+export enum Priority {
+  CRITICAL = 0,
+  HIGH = 1,
+  NORMAL = 2,
+  LOW = 3,
+}
 
-const AssetType = Object.freeze({
-  GLTF: "gltf",
-  TEXTURE: "texture",
-  CUBE_TEXTURE: "cubeTexture",
-  RGBE: "rgbe",
-  AUDIO: "audio",
-  JSON: "json",
-  BINARY: "binary",
-});
+export enum AssetType {
+  GLTF = "gltf",
+  TEXTURE = "texture",
+  CUBE_TEXTURE = "cubeTexture",
+  RGBE = "rgbe",
+  AUDIO = "audio",
+  JSON = "json",
+  BINARY = "binary",
+}
 
-const DEFAULT_OPTIONS = {
-  maxConcurrent: 6, // параллельных загрузок
-  maxCacheSize: 512, // МБ в кэше
-  defaultTTL: 300_000, // 5 мин (мс), 0 = бесконечно
+interface DefaultOptions {
+  maxConcurrent: number; // Parallel downloads
+  maxCacheSize: number; // MB in cache
+  defaultTTL: number; // 5 min (ms), 0 = infinite
+  maxRetries: number;
+  retryDelay: number; // base retry delay (ms)
+  dracoPath: string; // path to Draco decoder
+  ktx2TranscoderPath: string; // path to KTX2 transcoder
+  textureEncoding: THREE.ColorSpace;
+  generateMipmaps: boolean;
+  anisotropy: number;
+}
+
+const DEFAULT_OPTIONS: DefaultOptions = {
+  maxConcurrent: 6,
+  maxCacheSize: 512,
+  defaultTTL: 300_000,
   maxRetries: 3,
-  retryDelay: 500, // базовая задержка retry (мс)
-  dracoPath: "/draco/", // путь к Draco-декодеру
-  ktx2TranscoderPath: "/basis/", // путь к KTX2-транскодеру
+  retryDelay: 500,
+  dracoPath: "/dracopath/",
+  ktx2TranscoderPath: "/basis/",
   textureEncoding: THREE.SRGBColorSpace,
   generateMipmaps: true,
   anisotropy: 4,
 };
 
-// ─── Вспомогательные утилиты ─────────────────────────────────────────────────
+interface LoadOptions {
+  priority?: Priority;
+  type?: AssetType;
+  ttl?: number;
+  colorSpace?: THREE.ColorSpace;
+  generateMipmaps?: boolean;
+  anisotropy?: number;
+  wrapS?: THREE.Wrapping;
+  wrapT?: THREE.Wrapping;
+  faces?: string | string[]; // For cube textures
+}
 
-/** Простой EventEmitter без зависимостей */
+type LoadItem = string | ({ url: string } & LoadOptions);
+
+// ─── Helper Utilities ───────────────────────────────────────────────────────
+
+/** Simple EventEmitter without dependencies */
 class EventEmitter {
-  #handlers = new Map();
+  #handlers = new Map<string, Set<(...args: any[]) => void>>();
 
-  on(event, fn) {
-    (
-      this.#handlers.get(event) ??
-      this.#handlers.set(event, new Set()).get(event)
-    ).add(fn);
+  on(event: string, fn: (...args: any[]) => void): this {
+    if (!this.#handlers.has(event)) {
+      this.#handlers.set(event, new Set());
+    }
+    this.#handlers.get(event)!.add(fn);
     return this;
   }
-  off(event, fn) {
+
+  off(event: string, fn: (...args: any[]) => void): this {
     this.#handlers.get(event)?.delete(fn);
     return this;
   }
-  once(event, fn) {
-    const wrapper = (...args) => {
+
+  once(event: string, fn: (...args: any[]) => void): this {
+    const wrapper = (...args: any[]) => {
       fn(...args);
       this.off(event, wrapper);
     };
     return this.on(event, wrapper);
   }
-  emit(event, ...args) {
+
+  emit(event: string, ...args: any[]): void {
     this.#handlers.get(event)?.forEach((fn) => fn(...args));
   }
 }
 
-/** Приблизительный размер ресурса в байтах */
-function estimateSize(asset, type) {
+/** Approximate resource size in bytes */
+function estimateSize(asset: any, type: AssetType): number {
   if (!asset) return 0;
   switch (type) {
     case AssetType.TEXTURE: {
-      const t = asset;
+      const t = asset as THREE.Texture;
       if (!t.image) return 0;
       const { width = 0, height = 0 } = t.image;
-      // RGBA * mips ≈ 4/3
+      // RGBA * mips ≈ 4/3 factor
       return width * height * 4 * (t.generateMipmaps ? 1.33 : 1);
     }
     case AssetType.GLTF: {
       let bytes = 0;
-      asset.scene?.traverse((obj) => {
-        obj.geometry?.attributes &&
-          Object.values(obj.geometry.attributes).forEach((attr) => {
-            bytes += attr.array?.byteLength ?? 0;
-          });
-        obj.geometry?.index &&
-          (bytes += obj.geometry.index.array?.byteLength ?? 0);
-      });
+      const scene = asset.scene as THREE.Object3D;
+      if (scene) {
+        scene.traverse((obj: any) => {
+          if (obj.geometry?.attributes) {
+            Object.values(obj.geometry.attributes).forEach((attr: any) => {
+              bytes += attr.array?.byteLength ?? 0;
+            });
+          }
+          if (obj.geometry?.index) {
+            bytes += obj.geometry.index.array?.byteLength ?? 0;
+          }
+        });
+      }
       return bytes;
     }
     default:
@@ -103,13 +128,21 @@ function estimateSize(asset, type) {
   }
 }
 
-// ─── LRU-кэш ─────────────────────────────────────────────────────────────────
+// ─── LRU Cache ───────────────────────────────────────────────────────────────
+
+interface CacheEntry {
+  asset: any;
+  type: AssetType;
+  bytes: number;
+  expires: number;
+  lastUsed: number;
+}
 
 class LRUCache extends EventEmitter {
-  #map = new Map(); // url → CacheEntry
+  #map = new Map<string, CacheEntry>(); // url → CacheEntry
   #bytes = 0;
-  #maxBytes;
-  #defaultTTL;
+  #maxBytes: number;
+  #defaultTTL: number;
 
   constructor(maxMB = 512, defaultTTL = 0) {
     super();
@@ -117,19 +150,26 @@ class LRUCache extends EventEmitter {
     this.#defaultTTL = defaultTTL;
   }
 
-  get size() {
+  get size(): number {
     return this.#map.size;
   }
-  get bytes() {
+
+  get bytes(): number {
     return this.#bytes;
   }
 
-  set(url: string, asset, type, ttl = this.#defaultTTL) {
+  set(url: string, asset: any, type: AssetType, ttl = this.#defaultTTL): this {
     if (this.#map.has(url)) this.#evict(url);
 
     const bytes = estimateSize(asset, type);
     const expires = ttl > 0 ? Date.now() + ttl : Infinity;
-    const entry = { asset, type, bytes, expires, lastUsed: Date.now() };
+    const entry: CacheEntry = {
+      asset,
+      type,
+      bytes,
+      expires,
+      lastUsed: Date.now(),
+    };
 
     this.#map.set(url, entry);
     this.#bytes += bytes;
@@ -137,7 +177,7 @@ class LRUCache extends EventEmitter {
     return this;
   }
 
-  get(url: string) {
+  get(url: string): any {
     const entry = this.#map.get(url);
     if (!entry) return null;
 
@@ -146,14 +186,14 @@ class LRUCache extends EventEmitter {
       return null;
     }
 
-    // LRU: переносим в конец
+    // LRU: move to the end of the Map (most recently used)
     entry.lastUsed = Date.now();
     this.#map.delete(url);
     this.#map.set(url, entry);
     return entry.asset;
   }
 
-  has(url: string) {
+  has(url: string): boolean {
     const entry = this.#map.get(url);
     if (!entry) return false;
     if (Date.now() > entry.expires) {
@@ -163,18 +203,20 @@ class LRUCache extends EventEmitter {
     return true;
   }
 
-  /** Явное удаление + dispose GPU-ресурсов */
-  delete(url: string) {
+  /** Explicit removal + GPU resource disposal */
+  delete(url: string): void {
     if (this.#map.has(url)) {
       this.#evict(url, true);
     }
   }
 
-  clear(dispose = true) {
-    for (const url of [...this.#map.keys()]) this.#evict(url, dispose);
+  clear(dispose = true): void {
+    for (const url of [...this.#map.keys()]) {
+      this.#evict(url, dispose);
+    }
   }
 
-  /** Статистика */
+  /** Statistics */
   stats() {
     return {
       entries: this.#map.size,
@@ -184,9 +226,8 @@ class LRUCache extends EventEmitter {
     };
   }
 
-  // ─── приватные ─────────────────────────────────────────────────────────────
-
-  #evict(url: string, dispose = false) {
+  // Private methods
+  #evict(url: string, dispose = false): void {
     const entry = this.#map.get(url);
     if (!entry) return;
     this.#bytes -= entry.bytes;
@@ -195,38 +236,38 @@ class LRUCache extends EventEmitter {
     this.emit("evict", url, entry.asset);
   }
 
-  #enforceBudget() {
-    // Выселяем наименее использованные пока бюджет не восстановится
+  #enforceBudget(): void {
+    // Evict the oldest items until budget is recovered
     while (this.#bytes > this.#maxBytes && this.#map.size > 0) {
       const oldest = this.#map.keys().next().value;
-      this.#evict(oldest, true);
+      if (oldest !== undefined) this.#evict(oldest, true);
     }
   }
 
-  #dispose(asset, type: string) {
+  #dispose(asset: any, type: AssetType): void {
     if (!asset) return;
     try {
       switch (type) {
         case AssetType.TEXTURE:
         case AssetType.RGBE:
+        case AssetType.CUBE_TEXTURE:
           asset.dispose?.();
           break;
         case AssetType.GLTF:
-          asset.scene?.traverse((obj) => {
-            obj.geometry?.dispose();
+          asset.scene?.traverse((obj: any) => {
+            if (obj.geometry) obj.geometry.dispose();
             if (obj.material) {
               const mats = Array.isArray(obj.material)
                 ? obj.material
                 : [obj.material];
-              mats.forEach((m) => {
-                Object.values(m).forEach((v) => v?.isTexture && v.dispose());
+              mats.forEach((m: any) => {
+                Object.values(m).forEach(
+                  (v: any) => v?.isTexture && v.dispose(),
+                );
                 m.dispose();
               });
             }
           });
-          break;
-        case AssetType.CUBE_TEXTURE:
-          asset.dispose?.();
           break;
       }
     } catch (e) {
@@ -235,50 +276,67 @@ class LRUCache extends EventEmitter {
   }
 }
 
-// ─── Очередь с приоритетами ───────────────────────────────────────────────────
+// ─── Priority Queue ──────────────────────────────────────────────────────────
+
+interface QueueTask {
+  url: string;
+  opts: LoadOptions;
+  resolve: (value: any) => void;
+  reject: (reason: any) => void;
+}
 
 class PriorityQueue {
-  #buckets = [[], [], [], []]; // индекс = Priority
+  #buckets: Array<Array<QueueTask>> = [[], [], [], []]; // Index matches Priority enum
 
-  enqueue(item, priority = Priority.NORMAL) {
+  enqueue(item: QueueTask, priority: Priority = Priority.NORMAL): void {
     this.#buckets[priority].push(item);
   }
 
-  dequeue() {
+  dequeue(): QueueTask | null {
     for (const bucket of this.#buckets) {
-      if (bucket.length) return bucket.shift();
+      if (bucket.length > 0) return bucket.shift() || null;
     }
     return null;
   }
 
-  get size() {
+  get size(): number {
     return this.#buckets.reduce((s, b) => s + b.length, 0);
   }
 
-  remove(predicate) {
+  remove(predicate: (item: QueueTask) => boolean): void {
     this.#buckets.forEach((b, i) => {
       this.#buckets[i] = b.filter((item) => !predicate(item));
     });
   }
 }
 
-// ─── Основной AssetManager ────────────────────────────────────────────────────
+// ─── Main AssetManager ───────────────────────────────────────────────────────
 
 export class AssetManager extends EventEmitter {
-  #cache;
+  #cache: LRUCache;
   #queue = new PriorityQueue();
-  #inflight = new Map(); // url → Promise
+  #inflight = new Map<string, Promise<any>>(); // url → Promise
   #active = 0;
-  #opts;
-  #loaders = {};
-  #renderer = null;
+  #opts: DefaultOptions;
+  #loaders: {
+    gltf: GLTFLoader;
+    texture: THREE.TextureLoader;
+    cubeTexture: THREE.CubeTextureLoader;
+    rgbe: RGBELoader;
+    ktx2?: KTX2Loader;
+  } = {};
+  #renderer: THREE.WebGLRenderer | null;
+  #inflightControllers = new Map<string, AbortController>();
   #stats = { loaded: 0, failed: 0, cacheHits: 0 };
 
   /**
-   * @param {Partial<typeof DEFAULT_OPTIONS>} options
-   * @param {THREE.WebGLRenderer} [renderer] — нужен для KTX2Loader
+   * @param options Partial configuration overriding defaults
+   * @param renderer Required for KTX2Loader support
    */
-  constructor(options = {}, renderer = null) {
+  constructor(
+    options: Partial<DefaultOptions> = {},
+    renderer: THREE.WebGLRenderer | null = null,
+  ) {
     super();
     this.#opts = { ...DEFAULT_OPTIONS, ...options };
     this.#renderer = renderer;
@@ -287,16 +345,16 @@ export class AssetManager extends EventEmitter {
     this.#initLoaders();
   }
 
-  // ─── Публичное API ────────────────────────────────────────────────────────
+  // ─── Public API ────────────────────────────────────────────────────────────
 
-  /** Загрузить один ресурс */
-  load(url: string, options = {}) {
+  /** Load a single resource */
+  load(url: string, options: LoadOptions = {}): Promise<any> {
     return this.#scheduleLoad(url, options);
   }
 
-  /** Загрузить несколько ресурсов параллельно (возвращает Map url→asset) */
-  async loadAll(items) {
-    const results = new Map();
+  /** Load multiple resources in parallel (returns Map of url → asset) */
+  async loadAll(items: LoadItem[]): Promise<Map<string, any>> {
+    const results = new Map<string, any>();
     await Promise.allSettled(
       items.map(async (item) => {
         const url = typeof item === "string" ? item : item.url;
@@ -313,13 +371,13 @@ export class AssetManager extends EventEmitter {
   }
 
   /**
-   * Предзагрузка ресурсов в фоне (не блокирует)
+   * Preload resources in the background (non-blocking)
    * items = string[] | Array<{url, type, priority}>
    */
-  preload(items, defaultPriority = Priority.LOW) {
+  preload(items: LoadItem[], defaultPriority: Priority = Priority.LOW): void {
     items.forEach((item) => {
       const url = typeof item === "string" ? item : item.url;
-      const opts =
+      const opts: LoadOptions =
         typeof item === "string"
           ? { priority: defaultPriority }
           : { priority: defaultPriority, ...item };
@@ -329,35 +387,35 @@ export class AssetManager extends EventEmitter {
     });
   }
 
-  /** Проверить наличие в кэше */
-  isCached(url: string) {
+  /** Check if resource is in cache */
+  isCached(url: string): boolean {
     return this.#cache.has(url);
   }
 
-  /** Получить из кэша без загрузки */
-  getFromCache(url: string) {
+  /** Get from cache without loading */
+  getFromCache(url: string): any {
     return this.#cache.get(url) ?? null;
   }
 
-  /** Удалить из кэша (с dispose) */
-  evict(url: string) {
+  /** Remove from cache (with disposal) */
+  evict(url: string): void {
     this.#cache.delete(url);
   }
 
-  /** Очистить весь кэш */
-  clearCache(dispose = true) {
+  /** Clear entire cache */
+  clearCache(dispose = true): void {
     this.#cache.clear(dispose);
   }
 
-  /** Отменить ожидающую загрузку */
-  cancel(url: string) {
+  /** Cancel a pending load */
+  cancel(url: string): void {
     this.#queue.remove((item) => item.url === url);
-    // Если уже inflight — прерываем через AbortController
-    const ctrl = this.#inflightControllers?.get(url);
+    const ctrl = this.#inflightControllers.get(url);
     ctrl?.abort();
+    this.#inflightControllers.delete(url);
   }
 
-  /** Статистика */
+  /** Get manager statistics */
   stats() {
     return {
       ...this.#stats,
@@ -367,19 +425,17 @@ export class AssetManager extends EventEmitter {
     };
   }
 
-  /** Уничтожить менеджер */
-  dispose() {
+  /** Destroy the manager and clean up all resources */
+  dispose(): void {
     this.#cache.clear(true);
     this.#inflight.clear();
     this.emit("dispose");
   }
 
-  // ─── Приватные методы ─────────────────────────────────────────────────────
+  // ─── Private Methods ───────────────────────────────────────────────────────
 
-  #inflightControllers = new Map();
-
-  #scheduleLoad(url: string, opts = {}) {
-    // 1. Кэш
+  #scheduleLoad(url: string, opts: LoadOptions = {}): Promise<any> {
+    // 1. Check Cache
     const cached = this.#cache.get(url);
     if (cached) {
       this.#stats.cacheHits++;
@@ -387,12 +443,12 @@ export class AssetManager extends EventEmitter {
       return Promise.resolve(cached);
     }
 
-    // 2. Дедупликация inflight
+    // 2. Deduplicate inflight requests
     if (this.#inflight.has(url)) return this.#inflight.get(url);
 
-    // 3. Очередь
+    // 3. Queue the task
     const priority = opts.priority ?? Priority.NORMAL;
-    const promise = new Promise((resolve, reject) => {
+    const promise = new Promise<any>((resolve, reject) => {
       this.#queue.enqueue({ url, opts, resolve, reject }, priority);
     });
 
@@ -402,7 +458,7 @@ export class AssetManager extends EventEmitter {
     return promise;
   }
 
-  #drain() {
+  #drain(): void {
     while (this.#active < this.#opts.maxConcurrent) {
       const task = this.#queue.dequeue();
       if (!task) break;
@@ -414,7 +470,7 @@ export class AssetManager extends EventEmitter {
     }
   }
 
-  async #execute(task) {
+  async #execute(task: QueueTask): Promise<void> {
     const { url, opts, resolve, reject } = task;
     const abortCtrl = new AbortController();
     this.#inflightControllers.set(url, abortCtrl);
@@ -432,7 +488,7 @@ export class AssetManager extends EventEmitter {
         this.#inflightControllers.delete(url);
         resolve(asset);
         return;
-      } catch (err) {
+      } catch (err: any) {
         if (err.name === "AbortError") {
           reject(err);
           return;
@@ -452,9 +508,13 @@ export class AssetManager extends EventEmitter {
     }
   }
 
-  #loadAsset(url: string, opts, signal: AbortSignal) {
+  async #loadAsset(
+    url: string,
+    opts: LoadOptions,
+    signal: AbortSignal,
+  ): Promise<any> {
     const type = opts.type ?? this.detectType(url);
-    const onProgress = (e) => {
+    const onProgress = (e: ProgressEvent) => {
       if (e.lengthComputable) {
         this.emit("progress", url, e.loaded / e.total, e.loaded, e.total);
       }
@@ -476,34 +536,41 @@ export class AssetManager extends EventEmitter {
       case AssetType.BINARY:
         return this.loadBinary(url, signal);
       default:
-        return Promise.reject(
-          new Error(`[AssetManager] Unknown type for: ${url}`),
-        );
+        throw new Error(`[AssetManager] Unknown type for: ${url}`);
     }
   }
 
-  // ─── Загрузчики ──────────────────────────────────────────────────────────
+  // ─── Loaders ──────────────────────────────────────────────────────────────
 
-  private loadGLTF(url: string, onProgress, _signal: AbortSignal) {
+  private loadGLTF(
+    url: string,
+    onProgress: (e: ProgressEvent) => void,
+    _signal: AbortSignal,
+  ): Promise<any> {
     return new Promise((resolve, reject) => {
       this.#loaders.gltf.load(url, resolve, onProgress, reject);
     });
   }
 
-  private loadTexture(url: string, opts, onProgress, _signal: AbortSignal) {
+  private loadTexture(
+    url: string,
+    opts: LoadOptions,
+    onProgress: (e: ProgressEvent) => void,
+    _signal: AbortSignal,
+  ): Promise<any> {
     return new Promise((resolve, reject) => {
       const loader = url.endsWith(".ktx2")
         ? this.#loaders.ktx2
         : this.#loaders.texture;
-      loader.load(
+      loader!.load(
         url,
-        (tex) => {
+        (tex: THREE.Texture) => {
           tex.colorSpace = opts.colorSpace ?? this.#opts.textureEncoding;
           if (opts.generateMipmaps !== undefined)
             tex.generateMipmaps = opts.generateMipmaps;
           if (this.#opts.anisotropy) tex.anisotropy = this.#opts.anisotropy;
-          if (opts.wrapS) tex.wrapS = opts.wrapS;
-          if (opts.wrapT) tex.wrapT = opts.wrapT;
+          if (opts.wrapS !== undefined) tex.wrapS = opts.wrapS;
+          if (opts.wrapT !== undefined) tex.wrapT = opts.wrapT;
           tex.needsUpdate = true;
           resolve(tex);
         },
@@ -513,19 +580,27 @@ export class AssetManager extends EventEmitter {
     });
   }
 
-  private loadCubeTexture(url: string, opts, onProgress, _signal: AbortSignal) {
+  private loadCubeTexture(
+    url: string,
+    opts: LoadOptions,
+    onProgress: (e: ProgressEvent) => void,
+    _signal: AbortSignal,
+  ): Promise<any> {
     return new Promise((resolve, reject) => {
-      // url — путь-шаблон или массив из 6 URL
       const urls = Array.isArray(url) ? url : (opts.faces ?? url);
       this.#loaders.cubeTexture.load(urls, resolve, onProgress, reject);
     });
   }
 
-  private loadRGBE(url: string, onProgress, _signal: AbortSignal) {
+  private loadRGBE(
+    url: string,
+    onProgress: (e: ProgressEvent) => void,
+    _signal: AbortSignal,
+  ): Promise<any> {
     return new Promise((resolve, reject) => {
       this.#loaders.rgbe.load(
         url,
-        (tex) => {
+        (tex: THREE.Texture) => {
           tex.mapping = THREE.EquirectangularReflectionMapping;
           resolve(tex);
         },
@@ -535,27 +610,33 @@ export class AssetManager extends EventEmitter {
     });
   }
 
-  private async loadAudio(url: string, signal: AbortSignal) {
+  private async loadAudio(
+    url: string,
+    signal: AbortSignal,
+  ): Promise<ArrayBuffer> {
     const res = await fetch(url, { signal });
     if (!res.ok) throw new Error(`HTTP ${res.status} loading ${url}`);
     return res.arrayBuffer();
   }
 
-  private async loadJSON(url: string, signal: AbortSignal) {
+  private async loadJSON(url: string, signal: AbortSignal): Promise<any> {
     const res = await fetch(url, { signal });
     if (!res.ok) throw new Error(`HTTP ${res.status} loading ${url}`);
     return res.json();
   }
 
-  private async loadBinary(url: string, signal: AbortSignal) {
+  private async loadBinary(
+    url: string,
+    signal: AbortSignal,
+  ): Promise<ArrayBuffer> {
     const res = await fetch(url, { signal });
     if (!res.ok) throw new Error(`HTTP ${res.status} loading ${url}`);
     return res.arrayBuffer();
   }
 
-  // ─── Инициализация загрузчиков ────────────────────────────────────────────
+  // ─── Initialization ───────────────────────────────────────────────────────
 
-  #initLoaders() {
+  #initLoaders(): void {
     const manager = new THREE.LoadingManager();
     manager.onProgress = (url, loaded, total) =>
       this.emit("managerProgress", url, loaded, total);
@@ -568,7 +649,7 @@ export class AssetManager extends EventEmitter {
     const gltf = new GLTFLoader(manager);
     gltf.setDRACOLoader(draco);
 
-    // KTX2 (нужен renderer)
+    // KTX2 (requires renderer)
     if (this.#renderer) {
       const ktx2 = new KTX2Loader(manager);
       ktx2.setTranscoderPath(this.#opts.ktx2TranscoderPath);
@@ -582,11 +663,9 @@ export class AssetManager extends EventEmitter {
     this.#loaders.rgbe = new RGBELoader(manager);
   }
 
-  // ─── Определение типа по расширению ──────────────────────────────────────
-
-  private detectType(url: any) {
-    const ext = url.split("?")[0].split(".").pop().toLowerCase();
-    const map = {
+  private detectType(url: string): AssetType {
+    const ext = url.split("?")[0].split(".").pop()?.toLowerCase();
+    const map: Record<string, AssetType> = {
       glb: AssetType.GLTF,
       gltf: AssetType.GLTF,
       png: AssetType.TEXTURE,
@@ -603,16 +682,16 @@ export class AssetManager extends EventEmitter {
       json: AssetType.JSON,
       bin: AssetType.BINARY,
     };
-    return map[ext] ?? AssetType.BINARY;
+    return map[ext ?? ""] ?? AssetType.BINARY;
   }
 }
 
-// ─── Экспорт вспомогательных констант ────────────────────────────────────────
+// ─── Factory Function ───────────────────────────────────────────────────────
 
-export { Priority, AssetType };
-
-// ─── Фабричная функция ────────────────────────────────────────────────────────
-
-export function createAssetManager(options = {}, renderer = null) {
+/** Creates a new AssetManager instance */
+export function createAssetManager(
+  options: Partial<DefaultOptions> = {},
+  renderer: THREE.WebGLRenderer | null = null,
+): AssetManager {
   return new AssetManager(options, renderer);
 }
