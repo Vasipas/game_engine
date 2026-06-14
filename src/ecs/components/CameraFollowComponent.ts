@@ -10,5 +10,6 @@ export class CameraFollowComponent {
     public height = 5,
     public minDistance = 2,
     public maxDistance = 20,
+    public initialized = false,
   ) {}
 }

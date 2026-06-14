@@ -4,7 +4,7 @@ import { RotateComponent } from "../components/RotateComponent";
 import type { World } from "../World";
 
 export class RenderSyncSystem {
-  public priority = 3;
+  public priority = 5;
   constructor(private world: World) {}
 
   update(delta: number) {

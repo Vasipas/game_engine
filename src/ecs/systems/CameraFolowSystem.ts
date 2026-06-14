@@ -5,12 +5,10 @@ import type { World } from "../World";
 import * as THREE from "three";
 
 export class CameraFollowSystem {
-  public priority = 2;
+  public priority = 3;
 
   private _tmpPosition = new THREE.Vector3();
   private _direction = new THREE.Vector3();
-
-  private firstUpdate = true;
 
   constructor(private world: World) {}
 
@@ -49,16 +47,20 @@ export class CameraFollowSystem {
       this._direction.multiplyScalar(distance);
       this._tmpPosition.copy(position).sub(this._direction);
       this._tmpPosition.y += follow.height ?? 0;
+      const alpha = 1 - Math.exp(-follow.smoothing * delta);
 
-      if (this.firstUpdate) {
+      if (!follow.initialized) {
         follow.camera.position.copy(this._tmpPosition);
-        this.firstUpdate = false;
+        follow.initialized = true;
       } else {
-        const alpha = 1 - Math.exp(-follow.smoothing * delta);
         follow.camera.position.lerp(this._tmpPosition, alpha);
       }
 
+      const targetQuat = new THREE.Quaternion();
+
       follow.camera.lookAt(position.x, position.y, position.z);
+      targetQuat.copy(follow.camera.quaternion);
+      follow.camera.quaternion.slerp(targetQuat, alpha);
     }
   }
 }

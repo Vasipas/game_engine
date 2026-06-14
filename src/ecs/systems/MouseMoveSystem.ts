@@ -18,7 +18,7 @@ export class MouseMoveSystem {
 
       look.yaw -= dx * look.sensitivity;
       look.pitch -= dy * look.sensitivity;
-      look.pitch = Math.max(-1.5, Math.min(1.5, look.pitch));
+      look.pitch = Math.max(-1.5, Math.min(1, look.pitch));
     }
   }
 }
