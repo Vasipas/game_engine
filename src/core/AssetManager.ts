@@ -24,13 +24,13 @@ export enum AssetType {
 }
 
 interface DefaultOptions {
-  maxConcurrent: number; // Parallel downloads
-  maxCacheSize: number; // MB in cache
-  defaultTTL: number; // 5 min (ms), 0 = infinite
+  maxConcurrent: number;
+  maxCacheSize: number;
+  defaultTTL: number;
   maxRetries: number;
-  retryDelay: number; // base retry delay (ms)
-  dracoPath: string; // path to Draco decoder
-  ktx2TranscoderPath: string; // path to KTX2 transcoder
+  retryDelay: number;
+  dracoPath: string;
+  ktx2TranscoderPath: string;
   textureEncoding: THREE.ColorSpace;
   generateMipmaps: boolean;
   anisotropy: number;
@@ -58,21 +58,88 @@ interface LoadOptions {
   anisotropy?: number;
   wrapS?: THREE.Wrapping;
   wrapT?: THREE.Wrapping;
-  faces?: string | string[]; // For cube textures
+  faces?: string | string[];
 }
 
 type LoadItem = string | ({ url: string } & LoadOptions);
 
-// ─── Helper Utilities ───────────────────────────────────────────────────────
+// ─── Asset Group Handle ──────────────────────────────────────────────────────
 
-/** Simple EventEmitter without dependencies */
+export type GroupProgressCallback = (progress: {
+  loaded: number;
+  total: number;
+  ratio: number;
+  url: string;
+}) => void;
+
+/**
+ * Returned by `loadGroup()`. Attach progress callbacks, await the result,
+ * or cancel all pending loads in the group.
+ *
+ * @example
+ * const handle = manager.loadGroup("Level_1", urls);
+ * handle.onProgress(({ ratio }) => progressBar.style.width = `${ratio * 100}%`);
+ * const assets = await handle.promise;
+ */
+export class AssetGroupHandle {
+  readonly promise: Promise<Map<string, any>>;
+
+  #progressCallbacks = new Set<GroupProgressCallback>();
+  #loadedCount = 0;
+  readonly #total: number;
+  #cancelFn: () => void;
+
+  /** @internal */
+  constructor(
+    promise: Promise<Map<string, any>>,
+    total: number,
+    cancelFn: () => void,
+  ) {
+    this.promise = promise;
+    this.#total = total;
+    this.#cancelFn = cancelFn;
+  }
+
+  /**
+   * Register a callback for per-group load progress.
+   * Called every time one asset in this group finishes loading.
+   */
+  onProgress(cb: GroupProgressCallback): this {
+    this.#progressCallbacks.add(cb);
+    return this;
+  }
+
+  /** Remove a previously registered progress callback. */
+  offProgress(cb: GroupProgressCallback): this {
+    this.#progressCallbacks.delete(cb);
+    return this;
+  }
+
+  /** Cancel all still-pending loads that belong to this group. */
+  cancel(): void {
+    this.#cancelFn();
+  }
+
+  /** @internal — called by AssetManager when an asset finishes */
+  _notifyProgress(url: string): void {
+    this.#loadedCount++;
+    const payload = {
+      loaded: this.#loadedCount,
+      total: this.#total,
+      ratio: this.#total > 0 ? this.#loadedCount / this.#total : 1,
+      url,
+    };
+    this.#progressCallbacks.forEach((cb) => cb(payload));
+  }
+}
+
+// ─── Helper Utilities ────────────────────────────────────────────────────────
+
 class EventEmitter {
   #handlers = new Map<string, Set<(...args: any[]) => void>>();
 
   on(event: string, fn: (...args: any[]) => void): this {
-    if (!this.#handlers.has(event)) {
-      this.#handlers.set(event, new Set());
-    }
+    if (!this.#handlers.has(event)) this.#handlers.set(event, new Set());
     this.#handlers.get(event)!.add(fn);
     return this;
   }
@@ -95,7 +162,6 @@ class EventEmitter {
   }
 }
 
-/** Approximate resource size in bytes */
 function estimateSize(asset: any, type: AssetType): number {
   if (!asset) return 0;
   switch (type) {
@@ -103,7 +169,6 @@ function estimateSize(asset: any, type: AssetType): number {
       const t = asset as THREE.Texture;
       if (!t.image) return 0;
       const { width = 0, height = 0 } = t.image;
-      // RGBA * mips ≈ 4/3 factor
       return width * height * 4 * (t.generateMipmaps ? 1.33 : 1);
     }
     case AssetType.GLTF: {
@@ -136,10 +201,12 @@ interface CacheEntry {
   bytes: number;
   expires: number;
   lastUsed: number;
+  /** [1] Reference count — entry won't be evicted while refs > 0. */
+  refs: number;
 }
 
 class LRUCache extends EventEmitter {
-  #map = new Map<string, CacheEntry>(); // url → CacheEntry
+  #map = new Map<string, CacheEntry>();
   #bytes = 0;
   #maxBytes: number;
   #defaultTTL: number;
@@ -153,25 +220,22 @@ class LRUCache extends EventEmitter {
   get size(): number {
     return this.#map.size;
   }
-
   get bytes(): number {
     return this.#bytes;
   }
 
   set(url: string, asset: any, type: AssetType, ttl = this.#defaultTTL): this {
     if (this.#map.has(url)) this.#evict(url);
-
     const bytes = estimateSize(asset, type);
     const expires = ttl > 0 ? Date.now() + ttl : Infinity;
-    const entry: CacheEntry = {
+    this.#map.set(url, {
       asset,
       type,
       bytes,
       expires,
       lastUsed: Date.now(),
-    };
-
-    this.#map.set(url, entry);
+      refs: 0, // [1] start unpinned
+    });
     this.#bytes += bytes;
     this.#enforceBudget();
     return this;
@@ -180,13 +244,10 @@ class LRUCache extends EventEmitter {
   get(url: string): any {
     const entry = this.#map.get(url);
     if (!entry) return null;
-
     if (Date.now() > entry.expires) {
       this.#evict(url);
       return null;
     }
-
-    // LRU: move to the end of the Map (most recently used)
     entry.lastUsed = Date.now();
     this.#map.delete(url);
     this.#map.set(url, entry);
@@ -203,20 +264,52 @@ class LRUCache extends EventEmitter {
     return true;
   }
 
-  /** Explicit removal + GPU resource disposal */
-  delete(url: string): void {
-    if (this.#map.has(url)) {
+  // ─── [1] Reference counting ──────────────────────────────────────────────
+
+  /**
+   * Increment the reference counter for an entry.
+   * While refs > 0 the entry is "pinned" and will not be LRU-evicted.
+   * Returns the new ref count, or -1 if the entry doesn't exist.
+   */
+  acquire(url: string): number {
+    const entry = this.#map.get(url);
+    if (!entry) return -1;
+    entry.refs++;
+    return entry.refs;
+  }
+
+  /**
+   * Decrement the reference counter.
+   * When refs reach 0 the entry becomes evictable again.
+   * Optionally pass `dispose = true` to immediately evict if refs hit 0.
+   * Returns the new ref count, or -1 if the entry doesn't exist.
+   */
+  release(url: string, dispose = false): number {
+    const entry = this.#map.get(url);
+    if (!entry) return -1;
+    entry.refs = Math.max(0, entry.refs - 1);
+    if (dispose && entry.refs === 0) {
       this.#evict(url, true);
+      return 0;
     }
+    return entry.refs;
+  }
+
+  /** Current ref count for a url (0 = unpinned, -1 = not in cache). */
+  refCount(url: string): number {
+    return this.#map.get(url)?.refs ?? -1;
+  }
+
+  // ─── Existing methods ────────────────────────────────────────────────────
+
+  delete(url: string): void {
+    if (this.#map.has(url)) this.#evict(url, true);
   }
 
   clear(dispose = true): void {
-    for (const url of [...this.#map.keys()]) {
-      this.#evict(url, dispose);
-    }
+    for (const url of [...this.#map.keys()]) this.#evict(url, dispose);
   }
 
-  /** Statistics */
   stats() {
     return {
       entries: this.#map.size,
@@ -226,7 +319,6 @@ class LRUCache extends EventEmitter {
     };
   }
 
-  // Private methods
   #evict(url: string, dispose = false): void {
     const entry = this.#map.get(url);
     if (!entry) return;
@@ -237,10 +329,11 @@ class LRUCache extends EventEmitter {
   }
 
   #enforceBudget(): void {
-    // Evict the oldest items until budget is recovered
-    while (this.#bytes > this.#maxBytes && this.#map.size > 0) {
-      const oldest = this.#map.keys().next().value;
-      if (oldest !== undefined) this.#evict(oldest, true);
+    // Walk entries oldest-first; skip pinned ones (refs > 0)
+    for (const [url, entry] of this.#map) {
+      if (this.#bytes <= this.#maxBytes) break;
+      if (entry.refs > 0) continue; // [1] pinned — skip
+      this.#evict(url, true);
     }
   }
 
@@ -286,7 +379,7 @@ interface QueueTask {
 }
 
 class PriorityQueue {
-  #buckets: Array<Array<QueueTask>> = [[], [], [], []]; // Index matches Priority enum
+  #buckets: Array<Array<QueueTask>> = [[], [], [], []];
 
   enqueue(item: QueueTask, priority: Priority = Priority.NORMAL): void {
     this.#buckets[priority].push(item);
@@ -315,7 +408,7 @@ class PriorityQueue {
 export class AssetManager extends EventEmitter {
   #cache: LRUCache;
   #queue = new PriorityQueue();
-  #inflight = new Map<string, Promise<any>>(); // url → Promise
+  #inflight = new Map<string, Promise<any>>();
   #active = 0;
   #opts: DefaultOptions;
   #loaders: {
@@ -324,15 +417,14 @@ export class AssetManager extends EventEmitter {
     cubeTexture: THREE.CubeTextureLoader;
     rgbe: RGBELoader;
     ktx2?: KTX2Loader;
-  } = {};
+  } = {} as any;
   #renderer: THREE.WebGLRenderer | null;
   #inflightControllers = new Map<string, AbortController>();
   #stats = { loaded: 0, failed: 0, cacheHits: 0 };
 
-  /**
-   * @param options Partial configuration overriding defaults
-   * @param renderer Required for KTX2Loader support
-   */
+  // [2] Group registry: groupName → Set of URLs in the group
+  #groups = new Map<string, Set<string>>();
+
   constructor(
     options: Partial<DefaultOptions> = {},
     renderer: THREE.WebGLRenderer | null = null,
@@ -347,12 +439,10 @@ export class AssetManager extends EventEmitter {
 
   // ─── Public API ────────────────────────────────────────────────────────────
 
-  /** Load a single resource */
   load(url: string, options: LoadOptions = {}): Promise<any> {
     return this.#scheduleLoad(url, options);
   }
 
-  /** Load multiple resources in parallel (returns Map of url → asset) */
   async loadAll(items: LoadItem[]): Promise<Map<string, any>> {
     const results = new Map<string, any>();
     await Promise.allSettled(
@@ -370,10 +460,6 @@ export class AssetManager extends EventEmitter {
     return results;
   }
 
-  /**
-   * Preload resources in the background (non-blocking)
-   * items = string[] | Array<{url, type, priority}>
-   */
   preload(items: LoadItem[], defaultPriority: Priority = Priority.LOW): void {
     items.forEach((item) => {
       const url = typeof item === "string" ? item : item.url;
@@ -387,27 +473,151 @@ export class AssetManager extends EventEmitter {
     });
   }
 
-  /** Check if resource is in cache */
+  // ─── [2] Asset Groups ──────────────────────────────────────────────────────
+
+  /**
+   * Load a named group of assets.
+   * Every URL is reference-counted so that `unloadGroup()` only disposes
+   * assets that are not referenced by another group.
+   *
+   * @param name   Unique group identifier (e.g. "Level_1_Assets")
+   * @param items  Same format as `loadAll()` — strings or `{url, ...opts}` objects
+   * @returns      An `AssetGroupHandle` — attach `.onProgress()` or await `.promise`
+   *
+   * @example
+   * const handle = manager.loadGroup("Level_1", [
+   *   "assets/env.hdr",
+   *   { url: "assets/player.glb", priority: Priority.HIGH },
+   * ]);
+   * handle.onProgress(({ ratio }) => bar.value = ratio);
+   * const assets = await handle.promise;
+   */
+  loadGroup(name: string, items: LoadItem[]): AssetGroupHandle {
+    // Register or extend the group's URL set
+    if (!this.#groups.has(name)) this.#groups.set(name, new Set());
+    const groupUrls = this.#groups.get(name)!;
+
+    const urls = items.map((item) =>
+      typeof item === "string" ? item : item.url,
+    );
+    urls.forEach((url) => groupUrls.add(url));
+
+    // [3] Build the handle before firing loads so callbacks can be attached
+    //     synchronously before any micro-task resolves.
+    let cancelled = false;
+    const handle = new AssetGroupHandle(
+      /* promise — filled below */ Promise.resolve(new Map()),
+      urls.length,
+      () => {
+        cancelled = true;
+        urls.forEach((url) => this.cancel(url));
+      },
+    );
+
+    // Replace the placeholder promise with the real one
+    const realPromise = (async () => {
+      const results = new Map<string, any>();
+      await Promise.allSettled(
+        items.map(async (item) => {
+          const url = typeof item === "string" ? item : item.url;
+          const opts: LoadOptions = typeof item === "string" ? {} : item;
+          if (cancelled) return;
+          try {
+            const asset = await this.#scheduleLoad(url, opts);
+            // [1] Acquire a ref on behalf of this group
+            this.#cache.acquire(url);
+            results.set(url, asset);
+          } catch (e) {
+            results.set(url, { error: e });
+            this.emit("error", url, e);
+          } finally {
+            // [3] Notify group-level progress regardless of success/failure
+            handle._notifyProgress(url);
+          }
+        }),
+      );
+      return results;
+    })();
+
+    // Patch the handle's promise (the constructor stored a placeholder)
+    (handle as any).promise = realPromise;
+    return handle;
+  }
+
+  /**
+   * Release all assets that belong exclusively to `name`.
+   * Assets shared with another group are ref-decremented but not disposed.
+   *
+   * @param name     Group identifier passed to `loadGroup()`
+   * @param dispose  When true, immediately dispose GPU resources once refs hit 0
+   */
+  unloadGroup(name: string, dispose = true): void {
+    const groupUrls = this.#groups.get(name);
+    if (!groupUrls) {
+      console.warn(`[AssetManager] unloadGroup: unknown group "${name}"`);
+      return;
+    }
+
+    groupUrls.forEach((url) => {
+      // [1] Release this group's ref; dispose only when no one else holds it
+      this.#cache.release(url, dispose);
+    });
+
+    this.#groups.delete(name);
+    this.emit("groupUnloaded", name);
+  }
+
+  /** Returns the URLs currently registered in a group (snapshot). */
+  getGroupUrls(name: string): string[] {
+    return [...(this.#groups.get(name) ?? [])];
+  }
+
+  /** List all registered group names. */
+  get groupNames(): string[] {
+    return [...this.#groups.keys()];
+  }
+
+  // ─── [1] Reference counting (direct access) ────────────────────────────────
+
+  /**
+   * Manually pin an asset so it won't be LRU-evicted.
+   * You must pair every `acquire()` with a corresponding `release()`.
+   */
+  acquire(url: string): number {
+    return this.#cache.acquire(url);
+  }
+
+  /**
+   * Release a manual pin acquired with `acquire()`.
+   * Pass `dispose = true` to immediately free GPU memory when refs hit 0.
+   */
+  release(url: string, dispose = false): number {
+    return this.#cache.release(url, dispose);
+  }
+
+  /** Current reference count (-1 if not cached). */
+  refCount(url: string): number {
+    return this.#cache.refCount(url);
+  }
+
+  // ─── Cache helpers ────────────────────────────────────────────────────────
+
   isCached(url: string): boolean {
     return this.#cache.has(url);
   }
 
-  /** Get from cache without loading */
   getFromCache(url: string): any {
     return this.#cache.get(url) ?? null;
   }
 
-  /** Remove from cache (with disposal) */
   evict(url: string): void {
     this.#cache.delete(url);
   }
 
-  /** Clear entire cache */
   clearCache(dispose = true): void {
     this.#cache.clear(dispose);
   }
 
-  /** Cancel a pending load */
   cancel(url: string): void {
     this.#queue.remove((item) => item.url === url);
     const ctrl = this.#inflightControllers.get(url);
@@ -415,18 +625,21 @@ export class AssetManager extends EventEmitter {
     this.#inflightControllers.delete(url);
   }
 
-  /** Get manager statistics */
   stats() {
     return {
       ...this.#stats,
       queue: this.#queue.size,
       active: this.#active,
       cache: this.#cache.stats(),
+      groups: this.#groups.size, // [2]
     };
   }
 
-  /** Destroy the manager and clean up all resources */
   dispose(): void {
+    // Release all groups before clearing the cache
+    for (const name of [...this.#groups.keys()]) {
+      this.unloadGroup(name, false);
+    }
     this.#cache.clear(true);
     this.#inflight.clear();
     this.emit("dispose");
@@ -435,7 +648,6 @@ export class AssetManager extends EventEmitter {
   // ─── Private Methods ───────────────────────────────────────────────────────
 
   #scheduleLoad(url: string, opts: LoadOptions = {}): Promise<any> {
-    // 1. Check Cache
     const cached = this.#cache.get(url);
     if (cached) {
       this.#stats.cacheHits++;
@@ -443,10 +655,8 @@ export class AssetManager extends EventEmitter {
       return Promise.resolve(cached);
     }
 
-    // 2. Deduplicate inflight requests
-    if (this.#inflight.has(url)) return this.#inflight.get(url);
+    if (this.#inflight.has(url)) return this.#inflight.get(url)!;
 
-    // 3. Queue the task
     const priority = opts.priority ?? Priority.NORMAL;
     const promise = new Promise<any>((resolve, reject) => {
       this.#queue.enqueue({ url, opts, resolve, reject }, priority);
@@ -481,7 +691,6 @@ export class AssetManager extends EventEmitter {
         this.emit("loadStart", url, attempt);
         const asset = await this.#loadAsset(url, opts, abortCtrl.signal);
         const type = opts.type ?? this.detectType(url);
-
         this.#cache.set(url, asset, type, opts.ttl);
         this.#stats.loaded++;
         this.emit("load", url, asset);
@@ -641,7 +850,6 @@ export class AssetManager extends EventEmitter {
     manager.onProgress = (url, loaded, total) =>
       this.emit("managerProgress", url, loaded, total);
 
-    // GLTF + Draco
     const draco = new DRACOLoader();
     draco.setDecoderPath(this.#opts.dracoPath);
     draco.preload();
@@ -649,7 +857,6 @@ export class AssetManager extends EventEmitter {
     const gltf = new GLTFLoader(manager);
     gltf.setDRACOLoader(draco);
 
-    // KTX2 (requires renderer)
     if (this.#renderer) {
       const ktx2 = new KTX2Loader(manager);
       ktx2.setTranscoderPath(this.#opts.ktx2TranscoderPath);
@@ -686,9 +893,8 @@ export class AssetManager extends EventEmitter {
   }
 }
 
-// ─── Factory Function ───────────────────────────────────────────────────────
+// ─── Factory Function ─────────────────────────────────────────────────────────
 
-/** Creates a new AssetManager instance */
 export function createAssetManager(
   options: Partial<DefaultOptions> = {},
   renderer: THREE.WebGLRenderer | null = null,
